@@ -26,7 +26,9 @@
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/fstream.hpp>
 #include <boost/thread.hpp>
-
+#include <boost/random/mersenne_twister.hpp>
+#include <boost/random/uniform_int.hpp>
+#include <cmath>
 using namespace boost;
 using namespace std;
 
@@ -734,7 +736,7 @@ bool IsFinalTx(const CTransaction &tx, int nBlockHeight, int64_t nBlockTime)
 /**
  * Check transaction inputs to mitigate two
  * potential denial-of-service attacks:
- * 
+ *
  * 1. scriptSigs with extra data stuffed into them,
  *    not consumed by scriptPubKey (or P2SH script)
  * 2. P2SH scripts with a crazy number of expensive
@@ -1224,17 +1226,44 @@ bool ReadBlockFromDisk(CBlock& block, const CBlockIndex* pindex)
     return true;
 }
 
-CAmount GetBlockValue(int nHeight, const CAmount& nFees)
+int static generateMTRandom(unsigned int s, int range)
 {
-    CAmount nSubsidy = 50 * COIN;
-    int halvings = nHeight / Params().SubsidyHalvingInterval();
+	random::mt19937 gen(s);
+    random::uniform_int_distribution<> dist(1, range);
+    return dist(gen);
+}
 
-    // Force block reward to zero when right shift is undefined.
-    if (halvings >= 64)
-        return nFees;
+CAmount GetBlockValue(int nHeight, const CAmount& nFees, uint256 prevHash)
+{
+	// normal payout
+    int64_t nSubsidy = 1024 * COIN;
 
-    // Subsidy is cut in half every 210,000 blocks which will occur approximately every 4 years.
-    nSubsidy >>= halvings;
+	std::string cseed_str = prevHash.ToString().substr(5,7);
+	const char* cseed = cseed_str.c_str();
+	long seed = hex2long(cseed);
+	int rand = generateMTRandom(seed, 6000);
+
+	if(rand > 2000 && rand < 2101)
+	{
+		nSubsidy *= 8;
+	}
+
+	// 1st week bonus
+	if(nHeight < 2881)		// 1st 2 days
+	{
+		nSubsidy *= 5;
+	}
+	else if(nHeight < 5761)	// next 2 days
+	{
+		nSubsidy *= 3;
+	}
+	else if(nHeight < 10081)	// next 3 days
+	{
+		nSubsidy *= 2;
+	}
+
+	// Subsidy is cut in half every 129,600 blocks, which will occur approximately every 3 months
+    nSubsidy >>= (nHeight / 129600);
 
     return nSubsidy + nFees;
 }
@@ -1750,10 +1779,16 @@ bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pin
     int64_t nTime1 = GetTimeMicros(); nTimeConnect += nTime1 - nTimeStart;
     LogPrint("bench", "      - Connect %u transactions: %.2fms (%.3fms/tx, %.3fms/txin) [%.2fs]\n", (unsigned)block.vtx.size(), 0.001 * (nTime1 - nTimeStart), 0.001 * (nTime1 - nTimeStart) / block.vtx.size(), nInputs <= 1 ? 0 : 0.001 * (nTime1 - nTimeStart) / (nInputs-1), nTimeConnect * 0.000001);
 
-    if (block.vtx[0].GetValueOut() > GetBlockValue(pindex->nHeight, nFees))
+    uint256 prevHash = 0;
+    if(pindex->pprev)
+    {
+        prevHash = pindex->pprev->GetBlockHash();
+    }
+
+    if (block.vtx[0].GetValueOut() > GetBlockValue(pindex->nHeight, nFees, prevHash))
         return state.DoS(100,
                          error("ConnectBlock() : coinbase pays too much (actual=%d vs limit=%d)",
-                               block.vtx[0].GetValueOut(), GetBlockValue(pindex->nHeight, nFees)),
+                               block.vtx[0].GetValueOut(), GetBlockValue(pindex->nHeight, nFees, prevHash)),
                                REJECT_INVALID, "bad-cb-amount");
 
     if (!control.Wait())
@@ -1956,7 +1991,7 @@ static int64_t nTimeFlush = 0;
 static int64_t nTimeChainState = 0;
 static int64_t nTimePostConnect = 0;
 
-/** 
+/**
  * Connect a new block to chainActive. pblock is either NULL or a pointer to a CBlock
  * corresponding to pindexNew, to bypass loading it again from disk.
  */
